@@ -2,29 +2,94 @@ const express = require('express');
 const router = express.Router();
 const { authenticateToken } = require('../middleware/auth');
 const db = require('../db/inMemoryDb');
+const { logEvent, inMemoryLogs } = require('../config/logger');
 const { sendEmail, sendBulkEmails } = require('../utils/email');
 
 // Create event
 router.post('/', authenticateToken, (req, res) => {
     try {
+        // Get user ID from authenticated request
+        const userId = req.user?.id; // Add safe access with optional chaining
+
+        // Validate user ID
+        if (!userId) {
+            logEvent('error', 'User ID not found in request', {
+                action: 'CREATE_EVENT_ERROR',
+                error: 'User not authenticated properly'
+            });
+            return res.status(401).json({ error: 'User not authenticated properly' });
+        }
+
         const { title, description, date, time, capacity } = req.body;
+
+        // Validate required fields
+        if (!title || !date || !time || !capacity) {
+            logEvent('warn', 'Missing required fields in event creation', {
+                userId: userId,
+                action: 'CREATE_EVENT_VALIDATION_ERROR'
+            });
+            return res.status(400).json({ 
+                error: 'Missing required fields',
+                required: ['title', 'date', 'time', 'capacity']
+            });
+        }
+
         const eventId = Date.now().toString();
 
         const event = {
             id: eventId,
             title,
-            description,
+            description: description || '',
             date,
             time,
-            capacity,
-            createdBy: req.user.id,
-            participants: new Set()
+            capacity: parseInt(capacity),
+            createdBy: userId,
+            participants: new Set(),
+            createdAt: new Date().toISOString()
         };
 
+        // Store event in database
         db.events.set(eventId, event);
-        res.status(201).json({ message: 'Event created successfully', eventId });
+
+        // Log successful creation
+        logEvent('info', 'Event created successfully', {
+            userId: userId,  // Explicitly pass userId
+            eventId: eventId,
+            action: 'CREATE_EVENT',
+            metadata: {
+                title,
+                date,
+                time
+            }
+        });
+
+        res.status(201).json({ 
+            message: 'Event created successfully', 
+            event: {
+                id: eventId,
+                title: event.title,
+                description: event.description,
+                date: event.date,
+                time: event.time,
+                capacity: event.capacity,
+                createdAt: event.createdAt
+            }
+        });
+
     } catch (error) {
-        res.status(500).json({ error: 'Error creating event' });
+        console.error('Create event error:', error);
+        
+        // Log error with user ID if available
+        logEvent('error', 'Failed to create event', {
+            userId: req.user?.id || 'unknown',
+            error: error.message,
+            action: 'CREATE_EVENT_ERROR'
+        });
+
+        res.status(500).json({ 
+            error: 'Error creating event',
+            message: error.message 
+        });
     }
 });
 
@@ -37,11 +102,21 @@ router.put('/:id', authenticateToken, async (req, res) => {
 
         // Check if event exists
         if (!event) {
+            logEvent('warn', 'Update attempted on non-existent event', {
+                userId,
+                eventId,
+                action: 'UPDATE_EVENT_NOT_FOUND'
+            });
             return res.status(404).json({ error: 'Event not found' });
         }
 
         // Check if user is the event creator
         if (event.createdBy !== userId) {
+            logEvent('warn', 'Unauthorized event update attempt', {
+                userId,
+                eventId,
+                action: 'UPDATE_EVENT_UNAUTHORIZED'
+            });
             return res.status(403).json({ 
                 error: 'Unauthorized: Only the event creator can update this event' 
             });
@@ -68,36 +143,75 @@ router.put('/:id', authenticateToken, async (req, res) => {
             updatedAt: new Date().toISOString()
         };
 
-        db.events.set(eventId, updatedEvent);
+        // Track what was updated for logging
+        const updates = {
+            title: title !== event.title ? title : undefined,
+            description: description !== event.description ? description : undefined,
+            date: date !== event.date ? date : undefined,
+            time: time !== event.time ? time : undefined,
+            capacity: capacity !== event.capacity ? capacity : undefined
+        };
 
-        // If date/time changed, notify participants
-        if (date !== event.date || time !== event.time) {
-            const participants = Array.from(event.participants);
-            const notifications = await Promise.all(
-                participants.map(async (participantId) => {
-                    const participant = Array.from(db.users.values())
-                        .find(user => user.id === participantId);
-                    
-                    if (participant) {
-                        return {
-                            email: participant.email,
-                            subject: 'Event Update Notification',
-                            text: `The event "${updatedEvent.title}" has been updated.\n
-                                  New date: ${updatedEvent.date}\n
-                                  New time: ${updatedEvent.time}`
-                        };
-                    }
-                }).filter(Boolean)
-            );
+        // Filter out undefined values
+        const changedFields = Object.entries(updates)
+            .filter(([_, value]) => value !== undefined)
+            .map(([key]) => key);
 
-            // Send notifications in parallel
-            if (notifications.length > 0) {
-                await sendBulkEmails(notifications);
+        try {
+            // If date/time changed, attempt to notify participants
+            if (date !== event.date || time !== event.time) {
+                const participants = Array.from(event.participants);
+                const notifications = await Promise.all(
+                    participants.map(async (participantId) => {
+                        const participant = Array.from(db.users.values())
+                            .find(user => user.id === participantId);
+                        
+                        if (participant) {
+                            try {
+                                await sendEmail(
+                                    participant.email,
+                                    'Event Update Notification',
+                                    `The event "${updatedEvent.title}" has been updated.\n
+                                    New date: ${updatedEvent.date}\n
+                                    New time: ${updatedEvent.time}`
+                                );
+                            } catch (emailError) {
+                                // Log email failure but continue with update
+                                logEvent('warn', 'Failed to send update notification email', {
+                                    userId,
+                                    eventId,
+                                    participantId,
+                                    action: 'UPDATE_EVENT_EMAIL_FAILED',
+                                    error: emailError.message
+                                });
+                            }
+                        }
+                    })
+                );
             }
+        } catch (notificationError) {
+            // Log notification failure but continue with update
+            logEvent('warn', 'Failed to process notifications', {
+                userId,
+                eventId,
+                action: 'UPDATE_EVENT_NOTIFICATIONS_FAILED',
+                error: notificationError.message
+            });
         }
 
         // Update event in database
         db.events.set(eventId, updatedEvent);
+
+        // Log successful update
+        logEvent('info', 'Event updated successfully', {
+            userId,
+            eventId,
+            action: 'UPDATE_EVENT',
+            metadata: {
+                changedFields,
+                updatedAt: updatedEvent.updatedAt
+            }
+        });
 
         res.json({
             message: 'Event updated successfully',
@@ -110,11 +224,18 @@ router.put('/:id', authenticateToken, async (req, res) => {
                 capacity: updatedEvent.capacity,
                 participantCount: updatedEvent.participants.size,
                 updatedAt: updatedEvent.updatedAt
-            }
+            },
+            updatedFields: changedFields
         });
 
     } catch (error) {
         console.error('Error updating event:', error);
+        logEvent('error', 'Failed to update event', {
+            userId: req.user.id,
+            eventId: req.params.id,
+            error: error.message,
+            action: 'UPDATE_EVENT_ERROR'
+        });
         res.status(500).json({ 
             error: 'Error updating event',
             details: error.message 
@@ -326,6 +447,111 @@ router.get('/', authenticateToken, (req, res) => {
         console.error('Error fetching events:', error);
         res.status(500).json({ error: 'Error fetching events' });
     }
+});
+
+// Get event logs
+router.get('/logs', authenticateToken, (req, res) => {
+    try {
+        const userId = req.user.id;
+        
+        // Validate if user exists
+        if (!userId) {
+            logEvent('warn', 'Log request without valid user ID', {
+                action: 'FETCH_LOGS_ERROR'
+            });
+            return res.status(401).json({ error: 'User not authenticated' });
+        }
+
+        // Get logs from memory
+        const userLogs = inMemoryLogs.get(userId) || [];
+        
+        // Get query parameters for filtering
+        const { startDate, endDate, action, level } = req.query;
+        
+        let filteredLogs = [...userLogs]; // Create a copy of logs array
+
+        // Apply filters
+        if (startDate) {
+            const start = new Date(startDate);
+            if (isNaN(start.getTime())) {
+                return res.status(400).json({ error: 'Invalid start date format' });
+            }
+            filteredLogs = filteredLogs.filter(log => 
+                new Date(log.timestamp) >= start
+            );
+        }
+
+        if (endDate) {
+            const end = new Date(endDate);
+            if (isNaN(end.getTime())) {
+                return res.status(400).json({ error: 'Invalid end date format' });
+            }
+            filteredLogs = filteredLogs.filter(log => 
+                new Date(log.timestamp) <= end
+            );
+        }
+
+        if (action) {
+            filteredLogs = filteredLogs.filter(log => 
+                log.action && log.action.toLowerCase() === action.toLowerCase()
+            );
+        }
+
+        if (level) {
+            filteredLogs = filteredLogs.filter(log => 
+                log.level && log.level.toLowerCase() === level.toLowerCase()
+            );
+        }
+
+        // Sort logs by timestamp in descending order (newest first)
+        filteredLogs.sort((a, b) => 
+            new Date(b.timestamp) - new Date(a.timestamp)
+        );
+
+        logEvent('info', 'Logs retrieved successfully', {
+            userId,
+            action: 'FETCH_LOGS',
+            metadata: {
+                totalLogs: userLogs.length,
+                filteredLogs: filteredLogs.length,
+                filters: { startDate, endDate, action, level }
+            }
+        });
+
+        res.json({
+            total: filteredLogs.length,
+            filters: {
+                startDate: startDate || null,
+                endDate: endDate || null,
+                action: action || null,
+                level: level || null
+            },
+            logs: filteredLogs.map(log => ({
+                ...log,
+                timestamp: new Date(log.timestamp).toISOString()
+            }))
+        });
+
+    } catch (error) {
+        console.error('Error fetching logs:', error);
+        logEvent('error', 'Failed to fetch logs', {
+            userId: req.user?.id,
+            error: error.message,
+            action: 'FETCH_LOGS_ERROR'
+        });
+        res.status(500).json({ 
+            error: 'Error fetching logs',
+            details: error.message 
+        });
+    }
+});
+
+// Just to verify the auth middleware is working
+router.get('/test-auth', authenticateToken, (req, res) => {
+    res.json({
+        message: 'Auth working',
+        user: req.user
+    });
 });
 
 module.exports = router;
