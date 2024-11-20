@@ -95,4 +95,4 @@ npm start
 
 ## Development
 
-This is a development version using in-memory data structures. For production, implement proper database storage.
+This is a development version using in-memory data structures. 
