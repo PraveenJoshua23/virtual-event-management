@@ -8,7 +8,7 @@ const { sendEmail } = require('../utils/email');
 
 router.post('/register', async (req, res) => {
     try {
-        const { email, password, name } = req.body;
+        const { email, password, name, role = 'attendee' } = req.body;
 
         if (db.users.has(email)) {
             return res.status(400).json({ error: 'Email already registered' });
@@ -20,7 +20,16 @@ router.post('/register', async (req, res) => {
             email,
             password: hashedPassword,
             name,
-            id: Date.now().toString()
+            role,
+            id: Date.now().toString(),
+            profile: {
+                name,
+                bio: '',
+                interests: [],
+                createdAt: new Date().toISOString(),
+                eventsOrganized: 0,
+                eventsAttended: 0
+            }
         };
 
         db.users.set(email, user);
@@ -29,10 +38,13 @@ router.post('/register', async (req, res) => {
         await sendEmail(
             email,
             'Welcome to Virtual Event Platform',
-            `Hi ${name}, your account has been successfully created!`
+            `Hi ${name}, your account has been successfully created as an ${role}!`
         );
 
-        res.status(201).json({ message: 'User registered successfully' });
+        res.status(201).json({ 
+            message: 'User registered successfully',
+            role: user.role
+        });
     } catch (error) {
         res.status(500).json({ error: 'Error registering user' });
     }

@@ -9,7 +9,20 @@ const { sendEmail, sendBulkEmails } = require('../utils/email');
 router.post('/', authenticateToken, (req, res) => {
     try {
         // Get user ID from authenticated request
-        const userId = req.user?.id; // Add safe access with optional chaining
+        const userId = req.user?.id; 
+        const user = Array.from(db.users.values()).find(u => u.id === userId);
+
+        // Check if user is an organizer
+        if (user.role !== 'organizer') {
+            logEvent('warn', 'Unauthorized event creation attempt', {
+                userId,
+                action: 'CREATE_EVENT_UNAUTHORIZED'
+            });
+            return res.status(403).json({ 
+                error: 'Only organizers can create events' 
+            });
+        }
+
 
         // Validate user ID
         if (!userId) {
@@ -63,6 +76,10 @@ router.post('/', authenticateToken, (req, res) => {
             }
         });
 
+        // Update user's profile
+        user.profile.eventsOrganized++;
+        db.users.set(user.email, user);
+
         res.status(201).json({ 
             message: 'Event created successfully', 
             event: {
@@ -99,6 +116,14 @@ router.put('/:id', authenticateToken, async (req, res) => {
         const eventId = req.params.id;
         const event = db.events.get(eventId);
         const userId = req.user.id;
+        const user = Array.from(db.users.values()).find(u => u.id === userId);
+
+        // Check if user is an organizer
+        if (user.role !== 'organizer') {
+            return res.status(403).json({ 
+                error: 'Attendees cannot update events' 
+            });
+        }
 
         // Check if event exists
         if (!event) {
@@ -213,6 +238,10 @@ router.put('/:id', authenticateToken, async (req, res) => {
             }
         });
 
+        // Update user's profile
+        user.profile.eventsAttended++;
+        db.users.set(user.email, user);
+
         res.json({
             message: 'Event updated successfully',
             event: {
@@ -249,6 +278,13 @@ router.delete('/:id', authenticateToken, async (req, res) => {
         const eventId = req.params.id;
         const event = db.events.get(eventId);
         const userId = req.user.id;
+        const user = Array.from(db.users.values()).find(u => u.id === userId);
+
+        if (user.role !== 'organizer') {
+            return res.status(403).json({ 
+                error: 'Attendees cannot delete events' 
+            });
+        }
 
         // Check if event exists
         if (!event) {
@@ -319,6 +355,14 @@ router.post('/:id/register', authenticateToken, async (req, res) => {
         const eventId = req.params.id;
         const event = db.events.get(eventId);
         const userId = req.user.id;
+        const user = Array.from(db.users.values()).find(u => u.id === userId);
+
+        // Check if user is an attendee
+        if (user.role !== 'attendee') {
+            return res.status(403).json({ 
+                error: 'Organizers cannot register for events' 
+            });
+        }
 
         if (!event) {
             return res.status(404).json({ error: 'Event not found' });
@@ -343,10 +387,6 @@ router.post('/:id/register', authenticateToken, async (req, res) => {
 
         // Add event to user's registered events
         db.userEvents.get(userId).add(eventId);
-
-        // Send confirmation email
-        const user = Array.from(db.users.values())
-            .find(u => u.id === userId);
 
         if (user) {
             await sendEmail(
@@ -453,6 +493,14 @@ router.get('/', authenticateToken, (req, res) => {
 router.get('/logs', authenticateToken, (req, res) => {
     try {
         const userId = req.user.id;
+        const user = Array.from(db.users.values()).find(u => u.id === userId);
+
+        // Check if user is an organizer
+        if (user.role !== 'organizer') {
+            return res.status(403).json({ 
+                error: 'Attendees cannot get logs' 
+            });
+        }
         
         // Validate if user exists
         if (!userId) {
